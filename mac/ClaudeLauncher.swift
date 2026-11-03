@@ -320,6 +320,179 @@ enum AccountInfo {
     }
 }
 
+// MARK: - Usage limit snapshot
+
+struct UsageWindow {
+    var utilization: Double? // 0...1
+    var resetsAt: Date?
+    var hasReset: Bool { resetsAt.map { $0 <= Date() } ?? false }
+}
+
+struct UsageSnapshot {
+    var fiveHour: UsageWindow?
+    var weekly: UsageWindow?
+    var taken: Date
+}
+
+// Last rate-limit snapshot Claude cached with a conversation. It is NOT live: Claude fetches
+// current usage from the server and does not store it, so this can be days old.
+enum UsageInfo {
+    private static var cache: [String: (stamp: Date, usage: UsageSnapshot?)] = [:]
+    private static let lock = NSLock()
+
+    static func latest(_ dir: URL) -> UsageSnapshot? {
+        let blob = dir.appendingPathComponent("IndexedDB/https_claude.ai_0.indexeddb.blob")
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey]
+        guard let walker = FileManager.default.enumerator(at: blob, includingPropertiesForKeys: keys) else { return nil }
+        var files: [(url: URL, date: Date)] = []
+        for case let url as URL in walker {
+            guard let v = try? url.resourceValues(forKeys: Set(keys)), v.isRegularFile == true,
+                  (v.fileSize ?? 0) < 50_000_000 else { continue }
+            files.append((url, v.contentModificationDate ?? .distantPast))
+        }
+        let stamp = files.map { $0.date }.max() ?? .distantPast
+        lock.lock()
+        if let hit = cache[dir.path], hit.stamp == stamp { lock.unlock(); return hit.usage }
+        lock.unlock()
+
+        var best: UsageSnapshot?
+        for f in files {
+            guard let data = try? Data(contentsOf: f.url), let raw = unwrap([UInt8](data)),
+                  let found = parse(raw), found.taken > (best?.taken ?? .distantPast) else { continue }
+            best = found
+        }
+        lock.lock()
+        cache[dir.path] = (stamp, best)
+        lock.unlock()
+        return best
+    }
+
+    // Chromium IndexedDB values: 0xFF <version> then 0x02 = Snappy-compressed V8 data.
+    private static func unwrap(_ d: [UInt8]) -> [UInt8]? {
+        guard d.count > 4, d[0] == 0xFF else { return nil }
+        return d[2] == 0x02 ? snappy(d, from: 3) : d
+    }
+
+    // Raw (unframed) Snappy block decoder.
+    private static func snappy(_ src: [UInt8], from start: Int) -> [UInt8]? {
+        var pos = start, length = 0, shift = 0
+        while pos < src.count {
+            let b = Int(src[pos]); pos += 1
+            length |= (b & 0x7F) << shift
+            if b & 0x80 == 0 { break }
+            shift += 7
+        }
+        var dst = [UInt8](repeating: 0, count: length)
+        var d = 0
+        while pos < src.count && d < length {
+            let tag = Int(src[pos]); pos += 1
+            if tag & 3 == 0 {
+                var n = tag >> 2
+                if n >= 60 {
+                    let bytes = n - 59
+                    n = 0
+                    for i in 0..<bytes { guard pos < src.count else { return nil }; n |= Int(src[pos]) << (8 * i); pos += 1 }
+                }
+                n += 1
+                guard pos + n <= src.count, d + n <= length else { return nil }
+                dst.replaceSubrange(d..<(d + n), with: src[pos..<(pos + n)])
+                pos += n; d += n
+            } else {
+                var n = 0, offset = 0
+                switch tag & 3 {
+                case 1:
+                    guard pos < src.count else { return nil }
+                    n = ((tag >> 2) & 7) + 4; offset = ((tag >> 5) << 8) | Int(src[pos]); pos += 1
+                case 2:
+                    guard pos + 1 < src.count else { return nil }
+                    n = (tag >> 2) + 1; offset = Int(src[pos]) | (Int(src[pos + 1]) << 8); pos += 2
+                default:
+                    guard pos + 3 < src.count else { return nil }
+                    n = (tag >> 2) + 1
+                    offset = Int(src[pos]) | Int(src[pos + 1]) << 8 | Int(src[pos + 2]) << 16 | Int(src[pos + 3]) << 24
+                    pos += 4
+                }
+                guard offset > 0, offset <= d, d + n <= length else { return nil }
+                for _ in 0..<n { dst[d] = dst[d - offset]; d += 1 }
+            }
+        }
+        return dst
+    }
+
+    private static func find(_ needle: String, in hay: [UInt8], from: Int, to: Int) -> Int? {
+        let n = Array(needle.utf8)
+        guard !n.isEmpty, from >= 0, to <= hay.count, to - from >= n.count else { return nil }
+        var i = from
+        outer: while i <= to - n.count {
+            for j in 0..<n.count where hay[i + j] != n[j] { i += 1; continue outer }
+            return i
+        }
+        return nil
+    }
+
+    // rate_limit_info.unifiedWindows = { five_hour: { resetsAt, status, utilization }, seven_day: { ... } }
+    private static func parse(_ raw: [UInt8]) -> UsageSnapshot? {
+        var best: UsageSnapshot?
+        var from = 0
+        while let i = find("unifiedWindows", in: raw, from: from, to: raw.count) {
+            from = i + 1
+            let end = min(raw.count, i + 600)
+            let five = window(raw, i, end, "five_hour"), week = window(raw, i, end, "seven_day")
+            guard five != nil || week != nil, let taken = timestamp(raw, i) else { continue }
+            if taken > (best?.taken ?? .distantPast) { best = UsageSnapshot(fiveHour: five, weekly: week, taken: taken) }
+        }
+        return best
+    }
+
+    // V8 object: key string, then the value ('o' starts an object, '{' ends it).
+    private static func window(_ raw: [UInt8], _ from: Int, _ end: Int, _ name: String) -> UsageWindow? {
+        guard let k = find(name + "o", in: raw, from: from, to: end) else { return nil }
+        let objEnd = raw[k..<end].firstIndex(of: UInt8(ascii: "{")) ?? end
+        var w = UsageWindow(utilization: number(raw, k, objEnd, "utilization"), resetsAt: nil)
+        if let r = number(raw, k, objEnd, "resetsAt") { w.resetsAt = Date(timeIntervalSince1970: r > 1e12 ? r / 1000 : r) }
+        if let u = w.utilization, u > 1 { w.utilization = u / 100 }
+        return w.utilization != nil || w.resetsAt != nil ? w : nil
+    }
+
+    // 'N' = double (8 bytes LE), 'I' = zigzag varint int32.
+    private static func number(_ raw: [UInt8], _ from: Int, _ end: Int, _ key: String) -> Double? {
+        guard let k = find(key, in: raw, from: from, to: end) else { return nil }
+        var p = k + key.utf8.count
+        guard p < raw.count else { return nil }
+        if raw[p] == UInt8(ascii: "N"), p + 9 <= raw.count {
+            var bits: UInt64 = 0
+            for i in 0..<8 { bits |= UInt64(raw[p + 1 + i]) << (8 * UInt64(i)) }
+            return Double(bitPattern: bits)
+        }
+        if raw[p] == UInt8(ascii: "I") {
+            var v = 0, shift = 0
+            p += 1
+            while p < raw.count, shift < 35 {
+                v |= Int(raw[p] & 0x7F) << shift
+                if raw[p] & 0x80 == 0 { break }
+                p += 1; shift += 7
+            }
+            return Double((v >> 1) ^ -(v & 1))
+        }
+        return nil
+    }
+
+    private static let isoRegex = try! NSRegularExpression(pattern: "20\\d\\d-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(\\.\\d+)?Z")
+
+    private static func timestamp(_ raw: [UInt8], _ at: Int) -> Date? {
+        func iso(_ lo: Int, _ hi: Int, last: Bool) -> Date? {
+            let s = String(decoding: raw[max(0, lo)..<min(raw.count, hi)].map { $0 < 0x80 ? $0 : 0x2E }, as: UTF8.self)
+            let ms = isoRegex.matches(in: s, range: NSRange(s.startIndex..., in: s))
+            guard let m = last ? ms.last : ms.first, let r = Range(m.range, in: s) else { return nil }
+            let f = ISO8601DateFormatter()
+            f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let text = String(s[r])
+            return f.date(from: text) ?? ISO8601DateFormatter().date(from: text.replacingOccurrences(of: "\\.\\d+", with: "", options: .regularExpression))
+        }
+        return iso(at, at + 900, last: false) ?? iso(at - 600, at, last: true)
+    }
+}
+
 // MARK: - Setup copy
 
 struct CopyOptions {
@@ -491,6 +664,7 @@ final class AppModel: ObservableObject {
     @Published var profiles: [Profile] = []
     @Published var running: [String: pid_t] = [:] // profile id -> pid
     @Published var emails: [String: String] = [:] // profile id -> signed-in email
+    @Published var usages: [String: UsageSnapshot] = [:] // profile id -> last cached limit snapshot
     @Published var layout = LayoutSettings()
     @Published var customs: [ZoneLayout] = []
     @Published var arrangeStatus: String?
@@ -657,14 +831,17 @@ final class AppModel: ObservableObject {
             let procs = Claude.runningMains()
             var map: [String: pid_t] = [:]
             var mail: [String: String] = [:]
+            var usage: [String: UsageSnapshot] = [:]
             for p in snapshot {
                 if let pid = procs[Claude.key(p)] { map[p.id] = pid }
                 if let e = AccountInfo.email(p.dataDir) { mail[p.id] = e }
+                if let u = UsageInfo.latest(p.dataDir) { usage[p.id] = u }
             }
-            let result = map, emails = mail
+            let result = map, emails = mail, usages = usage
             await MainActor.run {
                 self.running = result
                 self.emails = emails
+                self.usages = usages
             }
         }
     }
@@ -961,6 +1138,54 @@ struct ContentView: View {
     }
 }
 
+// "5 jam [bar] 24%   Mingguan [bar] 38%   · data 30 Okt"
+struct UsageRow: View {
+    let usage: UsageSnapshot?
+    private static let id = Locale(identifier: "id_ID")
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let u = usage {
+                if let w = u.fiveHour { meter("5 jam", w) }
+                if let w = u.weekly { meter("Mingguan", w) }
+                Text("\u{00B7} data " + u.taken.formatted(.dateTime.day().month(.abbreviated).locale(UsageRow.id)))
+                    .foregroundColor(.muted).lineLimit(1)
+            } else {
+                Text("Limit: belum ada data").foregroundColor(.muted)
+            }
+        }
+        .font(.system(size: 11))
+        .help(tooltip)
+    }
+
+    func meter(_ label: String, _ w: UsageWindow) -> some View {
+        let value = w.hasReset ? 0 : min(1, max(0, w.utilization ?? 0))
+        return HStack(spacing: 6) {
+            Text(label).foregroundColor(.muted)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.border).frame(width: 44, height: 4)
+                if value > 0 { Capsule().fill(value >= 0.9 ? Color.danger : .text).frame(width: max(4, 44 * value), height: 4) }
+            }
+            Text(w.hasReset ? "reset" : "\(Int((value * 100).rounded()))%").foregroundColor(w.hasReset ? .muted : .text)
+        }
+    }
+
+    var tooltip: String {
+        guard let u = usage else { return "Belum ada snapshot limit di cache instance ini." }
+        let fmt = Date.FormatStyle().weekday(.abbreviated).day().month(.abbreviated).hour().minute().locale(UsageRow.id)
+        var lines: [String] = []
+        for (label, w) in [("5 jam", u.fiveHour), ("Mingguan", u.weekly)] {
+            guard let w = w else { continue }
+            let reset = w.resetsAt?.formatted(fmt) ?? "?"
+            lines.append(w.hasReset ? "\(label): sudah reset (\(reset))" : "\(label): \(Int(((w.utilization ?? 0) * 100).rounded()))%, reset \(reset)")
+        }
+        lines.append("")
+        lines.append("Snapshot terakhir di cache: " + u.taken.formatted(Date.FormatStyle().day().month(.abbreviated).year().hour().minute().locale(UsageRow.id)))
+        lines.append("Bukan angka live; buka popup limit di Claude untuk angka terkini.")
+        return lines.joined(separator: "\n")
+    }
+}
+
 struct PillSwitch: View {
     @Binding var isOn: Bool
 
@@ -1071,6 +1296,7 @@ struct ProfileCard: View {
                         .foregroundColor(email == nil ? .muted : .text).lineLimit(1).truncationMode(.middle)
                 }
                 .font(.system(size: 12))
+                UsageRow(usage: model.usages[profile.id]).padding(.top, 3)
             }
             Spacer(minLength: 8)
             PillSwitch(isOn: Binding(get: { model.layout.includes(profile) }, set: { model.setActive(profile, $0) }))
@@ -1087,7 +1313,7 @@ struct ProfileCard: View {
                 .overlay(Circle().stroke(Color.border))
         }
         .padding(.horizontal, 18)
-        .frame(height: 78)
+        .frame(height: 96)
         .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(hover ? Color.surfaceHover : .surface))
         .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(hover ? Color.borderHover : .border))
         .contentShape(Rectangle())

@@ -1124,6 +1124,7 @@ class ProfileCard : Control
     public bool Running { get; private set; }
     readonly FlatButton openBtn, moreBtn;
     readonly ToggleSwitch activeSwitch;
+    readonly ToolTip tips = new ToolTip { AutoPopDelay = 15000 };
     bool hover;
 
     public ProfileCard(Profile profile, bool active, Action<Profile> launch, Action<ProfileCard, Control> showMenu,
@@ -1132,7 +1133,7 @@ class ProfileCard : Control
         Profile = profile;
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-        Height = Theme.S(78);
+        Height = Theme.S(96);
         Margin = new Padding(0, 0, 0, Theme.S(10));
         BackColor = Theme.Bg;
         Cursor = Cursors.Default;
@@ -1176,6 +1177,34 @@ class ProfileCard : Control
         if (Email == email) return;
         Email = email;
         Invalidate();
+    }
+
+    public UsageSnapshot Usage { get; private set; }
+    static readonly System.Globalization.CultureInfo Indonesian = new System.Globalization.CultureInfo("id-ID");
+
+    public void SetUsage(UsageSnapshot usage)
+    {
+        if (Usage == usage) return;
+        Usage = usage;
+        tips.SetToolTip(this, UsageTooltip());
+        Invalidate();
+    }
+
+    string UsageTooltip()
+    {
+        if (Usage == null) return "Belum ada snapshot limit di cache instance ini.";
+        var lines = new List<string>();
+        foreach (var w in new[] { Tuple.Create("5 jam", Usage.FiveHour), Tuple.Create("Mingguan", Usage.Weekly) })
+        {
+            if (w.Item2 == null) continue;
+            var reset = w.Item2.ResetsAt.HasValue ? w.Item2.ResetsAt.Value.ToLocalTime().ToString("ddd d MMM HH:mm", Indonesian) : "?";
+            lines.Add(w.Item1 + ": " + (w.Item2.HasReset ? "sudah reset (" + reset + ")" :
+                Math.Round((w.Item2.Utilization ?? 0) * 100) + "%, reset " + reset));
+        }
+        lines.Add("");
+        lines.Add("Snapshot terakhir di cache: " + Usage.Taken.ToLocalTime().ToString("d MMM yyyy HH:mm", Indonesian));
+        lines.Add("Bukan angka live; buka popup limit di Claude untuk angka terkini.");
+        return string.Join("\n", lines);
     }
 
     void SetHover(bool value)
@@ -1253,7 +1282,7 @@ class ProfileCard : Control
         int nameH = TextRenderer.MeasureText(g, "Ag", Theme.Name, new Size(int.MaxValue, int.MaxValue), flags).Height;
         int subH = TextRenderer.MeasureText(g, "Ag", Theme.Small, new Size(int.MaxValue, int.MaxValue), flags).Height;
         int gap = Theme.S(3);
-        int ty = (Height - nameH - gap - subH) / 2;
+        int ty = (Height - nameH - gap - subH - Theme.S(6) - subH) / 2;
 
         TextRenderer.DrawText(g, Profile.Name, Theme.Name, new Rectangle(tx, ty, tw, nameH), Theme.Text,
             flags | TextFormatFlags.EndEllipsis);
@@ -1287,6 +1316,57 @@ class ProfileCard : Control
             TextRenderer.DrawText(g, "  ·  " + detail, Theme.Small,
                 new Rectangle(tx + sw, sy, tw - sw, subH), Email != null ? Theme.Text : Theme.Muted, flags | TextFormatFlags.EndEllipsis);
         }
+
+        DrawUsage(g, tx, sy + subH + Theme.S(6), tx + tw, subH, flags);
+    }
+
+    // "5 jam [bar] 24%   Mingguan [bar] 38%   · data 30 Okt 07:34"
+    void DrawUsage(Graphics g, int x, int y, int right, int h, TextFormatFlags flags)
+    {
+        if (Usage == null)
+        {
+            TextRenderer.DrawText(g, "Limit: belum ada data", Theme.Small, new Rectangle(x, y, right - x, h), Theme.Muted, flags | TextFormatFlags.EndEllipsis);
+            return;
+        }
+        foreach (var w in new[] { Tuple.Create("5 jam", Usage.FiveHour), Tuple.Create("Mingguan", Usage.Weekly) })
+        {
+            if (w.Item2 == null || x >= right) continue;
+            x = DrawMeter(g, x, y, right, h, w.Item1, w.Item2, flags) + Theme.S(12);
+        }
+        if (x < right)
+        {
+            TextRenderer.DrawText(g, "· data " + Usage.Taken.ToLocalTime().ToString("d MMM", Indonesian), Theme.Small,
+                new Rectangle(x, y, right - x, h), Theme.Muted, flags | TextFormatFlags.EndEllipsis);
+        }
+    }
+
+    int DrawMeter(Graphics g, int x, int y, int right, int h, string label, UsageWindow w, TextFormatFlags flags)
+    {
+        int lw = TextRenderer.MeasureText(g, label, Theme.Small, new Size(int.MaxValue, h), flags).Width;
+        TextRenderer.DrawText(g, label, Theme.Small, new Rectangle(x, y, Math.Min(lw, right - x), h), Theme.Muted, flags);
+        x += lw + Theme.S(6);
+
+        int barW = Theme.S(44), barH = Theme.S(4);
+        if (x + barW > right) return right;
+        var track = new RectangleF(x, y + (h - barH) / 2f, barW, barH);
+        double value = w.HasReset ? 0 : Math.Max(0, Math.Min(1, w.Utilization ?? 0));
+        using (var path = Theme.Round(track, barH / 2f))
+        using (var b = new SolidBrush(Theme.Border))
+            g.FillPath(b, path);
+        if (value > 0)
+        {
+            var fill = new RectangleF(track.X, track.Y, Math.Max(barH, (float)(barW * value)), barH);
+            using (var path = Theme.Round(fill, barH / 2f))
+            using (var b = new SolidBrush(value >= 0.9 ? Theme.Danger : Theme.Text))
+                g.FillPath(b, path);
+        }
+        x += barW + Theme.S(6);
+
+        var text = w.HasReset ? "reset" : Math.Round(value * 100) + "%";
+        int pw = TextRenderer.MeasureText(g, text, Theme.Small, new Size(int.MaxValue, h), flags).Width;
+        TextRenderer.DrawText(g, text, Theme.Small, new Rectangle(x, y, Math.Max(0, Math.Min(pw, right - x)), h),
+            w.HasReset ? Theme.Muted : Theme.Text, flags);
+        return x + pw;
     }
 }
 
@@ -1609,6 +1689,7 @@ partial class LauncherForm : Form
     readonly DarkRenderer renderer = new DarkRenderer();
     HashSet<string> running = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, string> emails = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); // data dir -> email
+    Dictionary<string, UsageSnapshot> usages = new Dictionary<string, UsageSnapshot>(StringComparer.OrdinalIgnoreCase); // data dir -> last limit snapshot
     ContextMenuStrip menu;
     bool polling;
 
@@ -1743,6 +1824,7 @@ partial class LauncherForm : Form
             var card = new ProfileCard(p, layout.Includes(p), Launch, ShowMenu, SetActive);
             card.SetRunning(running.Contains(Claude.Key(p)));
             card.SetEmail(EmailFor(p));
+            card.SetUsage(UsageFor(p));
             cards.Add(card);
             cardsPanel.Controls.Add(card);
         }
@@ -1783,16 +1865,20 @@ partial class LauncherForm : Form
         if (polling) return;
         polling = true;
         var dirs = profiles.Select(p => p.StorageDir).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        Task.Run(() => Tuple.Create(Claude.RunningKeys(), dirs.ToDictionary(d => d, AccountInfo.Email, StringComparer.OrdinalIgnoreCase))).ContinueWith(t =>
+        Task.Run(() => Tuple.Create(Claude.RunningKeys(),
+                dirs.ToDictionary(d => d, AccountInfo.Email, StringComparer.OrdinalIgnoreCase),
+                dirs.ToDictionary(d => d, UsageInfo.Latest, StringComparer.OrdinalIgnoreCase))).ContinueWith(t =>
         {
             polling = false;
             if (IsDisposed) return;
             running = t.Result.Item1;
             emails = t.Result.Item2;
+            usages = t.Result.Item3;
             foreach (var c in cards)
             {
                 c.SetRunning(running.Contains(Claude.Key(c.Profile)));
                 c.SetEmail(EmailFor(c.Profile));
+                c.SetUsage(UsageFor(c.Profile));
             }
             UpdateSummary();
         }, TaskScheduler.FromCurrentSynchronizationContext());
@@ -1802,6 +1888,12 @@ partial class LauncherForm : Form
     {
         string email;
         return emails.TryGetValue(p.StorageDir, out email) ? email : null;
+    }
+
+    UsageSnapshot UsageFor(Profile p)
+    {
+        UsageSnapshot usage;
+        return usages.TryGetValue(p.StorageDir, out usage) ? usage : null;
     }
 
     void PollSoon()
