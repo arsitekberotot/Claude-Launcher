@@ -1,0 +1,17 @@
+# Build output
+*.exe
+*.new.exe
+mac/build/
+
+# Per-user launcher data (profile names, layouts, presets, settings)
+profiles.txt
+profiles.json
+layout.txt
+layout.json
+layouts.txt
+layouts.json
+presets.txt
+presets.json
+settings.txt
+settings.json
+claude.ico
