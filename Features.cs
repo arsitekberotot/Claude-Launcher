@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -254,9 +255,10 @@ partial class LauncherForm
 
     // Close politely first so Claude can flush its state (it rewrites its settings on
     // exit); force-kill is the last resort after a grace period, not the first move.
+    // Blocks for up to the grace period: call it off the UI thread.
     static void Kill(int pid)
     {
-        if (CloseGracefully(pid, 6000)) return;
+        if (CloseGracefully(pid, 3000)) return;
         try
         {
             var psi = new ProcessStartInfo("taskkill", "/PID " + pid + " /T /F") { CreateNoWindow = true, UseShellExecute = false };
@@ -265,17 +267,32 @@ partial class LauncherForm
         catch { }
     }
 
+    // Success means the process exited, not that its window disappeared: closing Claude's
+    // window on Windows only hides it to the tray while the process keeps running.
     static bool CloseGracefully(int pid, int graceMs)
     {
-        var deadline = DateTime.UtcNow.AddMilliseconds(graceMs);
-        while (DateTime.UtcNow < deadline)
+        Process process;
+        try { process = Process.GetProcessById(pid); }
+        catch (ArgumentException) { return true; } // already gone
+        using (process)
         {
-            var handle = WindowArranger.MainWindow(pid);
-            if (handle == IntPtr.Zero) return true; // window gone: process exited (or is exiting)
-            HotkeyNative.PostMessage(handle, HotkeyNative.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-            Thread.Sleep(400);
+            var deadline = DateTime.UtcNow.AddMilliseconds(graceMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                var handle = WindowArranger.MainWindow(pid);
+                if (handle != IntPtr.Zero)
+                    HotkeyNative.PostMessage(handle, HotkeyNative.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                if (process.WaitForExit(400)) return true;
+            }
+            return process.HasExited;
         }
-        return false;
+    }
+
+    void KillInBackground(IEnumerable<int> pids)
+    {
+        var list = pids.ToList();
+        Task.Run(() => Parallel.ForEach(list, Kill)).ContinueWith(t => { if (!IsDisposed) Poll(); },
+            TaskScheduler.FromCurrentSynchronizationContext());
     }
 
     void CloseInstance(Profile p)
@@ -287,8 +304,7 @@ partial class LauncherForm
             return;
         }
         if (!DarkDialog.Confirm(this, "Tutup instance", "Tutup \"" + p.Name + "\"? Claude di instance ini akan dihentikan.", "Tutup", true)) return;
-        Kill(pid);
-        PollSoon();
+        KillInBackground(new[] { pid });
     }
 
     void CloseAll()
@@ -303,8 +319,7 @@ partial class LauncherForm
         if (!DarkDialog.Confirm(this, "Tutup semua instance",
             "Tutup " + targets.Count + " instance yang sedang berjalan?\n\n" + string.Join("\n", targets.Select(t => "• " + t.Name)),
             "Tutup semua", true)) return;
-        foreach (var t in targets) Kill(procs[Claude.Key(t)]);
-        PollSoon();
+        KillInBackground(targets.Select(t => procs[Claude.Key(t)]));
     }
 
     // ---------- presets ----------
@@ -439,7 +454,7 @@ partial class LauncherForm
         {
             var failed = new List<string>();
             if (HotkeyFailed(HotkeyArrange)) failed.Add("Ctrl+Alt+0");
-            for (int i = 1; i <= Math.Min(9, profiles.Count); i++)
+            for (int i = 1; i <= hotkeyOrder.Count; i++)
                 if (HotkeyFailed(i)) failed.Add("Ctrl+Alt+" + i);
             if (failed.Count > 0) lines.Add("Tidak bisa didaftarkan (dipakai aplikasi lain): " + string.Join(", ", failed));
         }
