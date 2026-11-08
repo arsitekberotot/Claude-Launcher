@@ -24,25 +24,22 @@ Each extra instance is Claude Desktop started with its own `--user-data-dir`.
 
 ### Windows
 
-Uses the C# compiler that ships with .NET Framework 4. The window icon is taken from the installed Claude app:
+Uses the C# compiler that ships with .NET Framework 4:
 
 ```powershell
-Add-Type -AssemblyName System.Drawing
-$claude = Join-Path (Get-AppxPackage *claude* | Select-Object -First 1 -ExpandProperty InstallLocation) 'app\Claude.exe'
-$fs = [IO.File]::Create("$PWD\claude.ico"); [Drawing.Icon]::ExtractAssociatedIcon($claude).Save($fs); $fs.Close()
-
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-& $csc /nologo /target:winexe /optimize /out:ClaudeLauncher.exe /win32icon:claude.ico `
+& $csc /nologo /target:winexe /optimize /out:ClaudeLauncher.exe /win32icon:assets\icon.ico `
   /r:System.Management.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll `
   ClaudeLauncher.cs LayoutEditor.cs Features.cs Usage.cs
 ```
 
 ### macOS
 
-Needs Xcode (the SwiftUI macro plugins are not in the Command Line Tools). `build.sh` uses `/Applications/Xcode-beta.app`; change `DEVELOPER_DIR` if Xcode lives elsewhere.
+Needs Xcode (the SwiftUI macro plugins are not in the Command Line Tools). `build.sh` defaults to `/Applications/Xcode-beta.app`; set `DEVELOPER_DIR` if Xcode lives elsewhere. The app is universal (Apple Silicon + Intel), macOS 14+.
 
 ```bash
-mac/build.sh   # installs ~/Applications/Claude Launcher.app
+mac/build.sh      # installs ~/Applications/Claude Launcher.app
+mac/make-dmg.sh   # also writes mac/build/ClaudeLauncher.dmg
 ```
 
 Open & arrange needs Accessibility permission (System Settings → Privacy & Security → Accessibility). The app is ad-hoc signed, so the permission has to be granted again after each rebuild.

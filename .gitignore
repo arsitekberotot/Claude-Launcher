@@ -1,4 +1,5 @@
 # Build output
+dist/
 *.exe
 *.new.exe
 mac/build/
