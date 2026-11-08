@@ -5,6 +5,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -113,6 +114,8 @@ static class HotkeyNative
 
     // Sent by a second launcher process so the running one shows itself, even from the tray.
     public static readonly int ShowMessage = RegisterWindowMessage("ClaudeLauncher.Show");
+
+    public const int WM_CLOSE = 0x0010;
 }
 
 // ---------------------------------------------------------------- launcher features
@@ -196,9 +199,20 @@ partial class LauncherForm
     {
         if (!settings.Hotkeys || hotkeysRegistered || !IsHandleCreated) return;
         uint mods = HotkeyNative.MOD_CONTROL | HotkeyNative.MOD_ALT | HotkeyNative.MOD_NOREPEAT;
-        for (int i = 1; i <= 9; i++) HotkeyNative.RegisterHotKey(Handle, i, mods, (uint)('0' + i));
-        HotkeyNative.RegisterHotKey(Handle, HotkeyArrange, mods, (uint)'0');
+        for (int i = 1; i <= 9; i++)
+            hotkeyFailed[i] = !HotkeyNative.RegisterHotKey(Handle, i, mods, (uint)('0' + i));
+        hotkeyFailed[HotkeyArrange] = !HotkeyNative.RegisterHotKey(Handle, HotkeyArrange, mods, (uint)'0');
+        hotkeyOrder.Clear();
+        for (int i = 0; i < Math.Min(9, profiles.Count); i++) hotkeyOrder.Add(profiles[i].Id);
         hotkeysRegistered = true;
+    }
+
+    // True where RegisterHotKey failed (combo owned by another app).
+    readonly Dictionary<int, bool> hotkeyFailed = new Dictionary<int, bool>();
+    public bool HotkeyFailed(int id)
+    {
+        bool failed;
+        return hotkeyFailed.TryGetValue(id, out failed) && failed;
     }
 
     void UnregisterHotkeys()
@@ -209,13 +223,17 @@ partial class LauncherForm
         hotkeysRegistered = false;
     }
 
+    // Snapshot of profile ids at registration time: Ctrl+Alt+N pinned to profiles[N-1]
+    // as of then, so reordering the list later doesn't silently remap the hotkeys.
+    readonly List<string> hotkeyOrder = new List<string>();
+
     protected override void WndProc(ref Message m)
     {
         if (m.Msg == HotkeyNative.WM_HOTKEY)
         {
             int id = m.WParam.ToInt32();
             if (id == HotkeyArrange) OpenAndArrange();
-            else if (id >= 1 && id <= profiles.Count) Launch(profiles[id - 1]);
+            else if (id >= 1 && id <= hotkeyOrder.Count) LaunchIfPresent(hotkeyOrder[id - 1]);
             return;
         }
         if (m.Msg == HotkeyNative.ShowMessage && HotkeyNative.ShowMessage != 0)
@@ -226,16 +244,38 @@ partial class LauncherForm
         base.WndProc(ref m);
     }
 
+    void LaunchIfPresent(string profileId)
+    {
+        var p = profiles.FirstOrDefault(x => string.Equals(x.Id, profileId, StringComparison.OrdinalIgnoreCase));
+        if (p != null) Launch(p);
+    }
+
     // ---------- close instances ----------
 
+    // Close politely first so Claude can flush its state (it rewrites its settings on
+    // exit); force-kill is the last resort after a grace period, not the first move.
     static void Kill(int pid)
     {
+        if (CloseGracefully(pid, 6000)) return;
         try
         {
             var psi = new ProcessStartInfo("taskkill", "/PID " + pid + " /T /F") { CreateNoWindow = true, UseShellExecute = false };
             using (var p = Process.Start(psi)) p.WaitForExit(5000);
         }
         catch { }
+    }
+
+    static bool CloseGracefully(int pid, int graceMs)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(graceMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            var handle = WindowArranger.MainWindow(pid);
+            if (handle == IntPtr.Zero) return true; // window gone: process exited (or is exiting)
+            HotkeyNative.PostMessage(handle, HotkeyNative.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            Thread.Sleep(400);
+        }
+        return false;
     }
 
     void CloseInstance(Profile p)
@@ -388,10 +428,22 @@ partial class LauncherForm
     void ShowHotkeyHelp()
     {
         var lines = new List<string> { "Ctrl+Alt+0  →  Buka & rapikan" };
-        for (int i = 0; i < Math.Min(9, profiles.Count); i++) lines.Add("Ctrl+Alt+" + (i + 1) + "  →  " + profiles[i].Name);
+        for (int i = 0; i < hotkeyOrder.Count; i++)
+        {
+            var name = profiles.FirstOrDefault(p => string.Equals(p.Id, hotkeyOrder[i], StringComparison.OrdinalIgnoreCase));
+            lines.Add("Ctrl+Alt+" + (i + 1) + "  →  " + (name != null ? name.Name : hotkeyOrder[i]));
+        }
         lines.Add("");
-        lines.Add(settings.Hotkeys ? "Hotkey sedang aktif. Nomor mengikuti urutan daftar." : "Hotkey sedang nonaktif. Aktifkan dari menu ≡.");
-        if (settings.Hotkeys && !hotkeysRegistered) lines.Add("Sebagian hotkey mungkin dipakai aplikasi lain.");
+        lines.Add(settings.Hotkeys ? "Hotkey mengikuti urutan daftar saat launcher dinyalakan." : "Hotkey sedang nonaktif. Aktifkan dari menu ≡.");
+        if (settings.Hotkeys && hotkeysRegistered)
+        {
+            var failed = new List<string>();
+            if (HotkeyFailed(HotkeyArrange)) failed.Add("Ctrl+Alt+0");
+            for (int i = 1; i <= Math.Min(9, profiles.Count); i++)
+                if (HotkeyFailed(i)) failed.Add("Ctrl+Alt+" + i);
+            if (failed.Count > 0) lines.Add("Tidak bisa didaftarkan (dipakai aplikasi lain): " + string.Join(", ", failed));
+        }
+        else if (settings.Hotkeys && !hotkeysRegistered) lines.Add("Sebagian hotkey mungkin dipakai aplikasi lain.");
         DarkDialog.Alert(this, "Hotkey global", string.Join("\n", lines));
     }
 
@@ -405,7 +457,8 @@ partial class LauncherForm
         {
             var p = profiles[i];
             var on = running.Contains(Claude.Key(p));
-            var label = (on ? "●  " : "○  ") + p.Name + (i < 9 ? "\tCtrl+Alt+" + (i + 1) : "");
+            var pinned = hotkeyOrder.IndexOf(p.Id);
+            var label = (on ? "●  " : "○  ") + p.Name + (pinned >= 0 ? "\tCtrl+Alt+" + (pinned + 1) : "");
             m.Items.Add(Item(label, () => Launch(p)));
         }
         m.Items.Add(new ToolStripSeparator());

@@ -277,7 +277,9 @@ static class Store
         var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude-Data");
         if (Directory.Exists(root))
         {
-            var dir = Directory.GetDirectories(root, "claude_*").FirstOrDefault();
+            var dir = Directory.GetDirectories(root, "claude_*")
+                .OrderByDescending(d => Directory.GetLastWriteTimeUtc(d))
+                .FirstOrDefault();
             if (dir != null) return dir;
         }
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude");
@@ -459,6 +461,9 @@ static class AccountInfo
 {
     static readonly Dictionary<string, KeyValuePair<DateTime, string>> cache =
         new Dictionary<string, KeyValuePair<DateTime, string>>(StringComparer.OrdinalIgnoreCase);
+    static readonly Dictionary<string, DateTime> nextProbe =
+        new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+    static readonly TimeSpan ProbeInterval = TimeSpan.FromSeconds(30);
     static readonly Encoding Latin1 = Encoding.GetEncoding(28591);
 
     public static string Email(string dataDir)
@@ -469,13 +474,23 @@ static class AccountInfo
             var blobDir = Path.Combine(dataDir, "IndexedDB", "https_claude.ai_0.indexeddb.blob");
             if (!File.Exists(configPath) || !Directory.Exists(blobDir)) return null;
 
+            // Cheap freshness probe first: a full recursive enumeration on every poll is
+            // too expensive while Claude runs, so it only happens when the config file or
+            // the blob tree's top level changed, and at most once every 30 seconds.
+            var probe = new[] { File.GetLastWriteTimeUtc(configPath), Directory.GetLastWriteTimeUtc(blobDir) }.Max();
+            KeyValuePair<DateTime, string> hit;
+            if (cache.TryGetValue(dataDir, out hit) && hit.Key == probe) return hit.Value;
+            var now = DateTime.UtcNow;
+            DateTime nextProbe;
+            if (AccountInfo.nextProbe.TryGetValue(dataDir, out nextProbe) && now < nextProbe) return hit.Value;
+            AccountInfo.nextProbe[dataDir] = now.Add(ProbeInterval);
+
             var files = new DirectoryInfo(blobDir).GetFiles("*", SearchOption.AllDirectories)
                 .Where(f => f.Length < 50 * 1024 * 1024)
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .ToList();
             var stamp = new[] { File.GetLastWriteTimeUtc(configPath) }
                 .Concat(files.Select(f => f.LastWriteTimeUtc)).Max();
-            KeyValuePair<DateTime, string> hit;
             if (cache.TryGetValue(dataDir, out hit) && hit.Key == stamp) return hit.Value;
 
             string email = null;
@@ -1952,6 +1967,8 @@ partial class LauncherForm : Form
             foreach (var t in targets)
             {
                 // Running but hidden in the tray: launching again makes Claude show its window.
+                // Launch() already alerts and swallows per-instance failures, so one bad
+                // instance cannot abort the arrange loop.
                 int pid;
                 if (procs.TryGetValue(Claude.Key(t), out pid) && WindowArranger.MainWindow(pid) != IntPtr.Zero) continue;
                 Launch(t);
@@ -2010,6 +2027,8 @@ partial class LauncherForm : Form
         if (name.Length == 0) return "Nama tidak boleh kosong.";
         if (name.Length > 40) return "Maksimal 40 karakter.";
         if (name.Contains("|")) return "Karakter | tidak boleh dipakai.";
+        if (name.Contains("\n") || name.Contains("\r") || name.Contains("\t"))
+            return "Karakter baris baru dan tab tidak boleh dipakai.";
         return null;
     }
 
@@ -2045,7 +2064,8 @@ partial class LauncherForm : Form
 
     void CopySetup(Profile target)
     {
-        if (running.Contains(Claude.Key(target)))
+        var procs = Claude.RunningProcesses();
+        if (procs.ContainsKey(Claude.Key(target)))
         {
             DarkDialog.Alert(this, "Tutup dulu",
                 "\"" + target.Name + "\" sedang berjalan. Tutup instance itu dulu, karena Claude menimpa setting-nya saat keluar.");
@@ -2058,6 +2078,13 @@ partial class LauncherForm : Form
             if (d.ShowDialog(this) != DialogResult.OK) return;
             source = d.Source;
             options = d.Options;
+        }
+        if (procs.ContainsKey(Claude.Key(source)) ||
+            Claude.RunningProcesses().ContainsKey(Claude.Key(source)))
+        {
+            DarkDialog.Alert(this, "Tutup dulu",
+                "\"" + source.Name + "\" sedang berjalan. Salin setup hanya dari instance yang sudah ditutup, karena filenya bisa sedang ditulis.");
+            return;
         }
         try
         {

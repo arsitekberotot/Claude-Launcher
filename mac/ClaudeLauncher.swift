@@ -218,15 +218,18 @@ enum Claude {
     static func runningMains() -> [String: pid_t] {
         let binary = appPath + "/Contents/MacOS/Claude"
         var map: [String: pid_t] = [:]
-        let regex = try! NSRegularExpression(pattern: "--user-data-dir=(.+?)(?= --|$)")
+        let marker = "--user-data-dir="
         for raw in run("/bin/ps", ["-axww", "-o", "pid=,command="]).split(separator: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
             guard let space = line.firstIndex(of: " "), let pid = pid_t(line[..<space]) else { continue }
             let cmd = String(line[line.index(after: space)...])
-            guard cmd.hasPrefix(binary), !cmd.contains("--type=") else { continue }
-            let ns = cmd as NSString
-            if let m = regex.firstMatch(in: cmd, range: NSRange(location: 0, length: ns.length)) {
-                let dir = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
+            guard cmd.hasPrefix(binary), !cmd.contains(" --type=") else { continue }
+            if let range = cmd.range(of: marker) {
+                // Value runs to the next space or closing quote; a literal " --" inside the
+                // path no longer truncates it the way the old lookahead regex did.
+                let rest = cmd[range.upperBound...].drop(while: { $0 == "\"" || $0 == "'" })
+                let end = rest.firstIndex(where: { $0 == " " || $0 == "\"" || $0 == "'" }) ?? rest.endIndex
+                let dir = String(rest[rest.startIndex..<end])
                 map[URL(fileURLWithPath: dir).standardizedFileURL.path] = pid
             } else {
                 map[Profile.defaultId] = pid
