@@ -26,6 +26,9 @@ static class UsageInfo
 {
     static readonly Dictionary<string, KeyValuePair<DateTime, UsageSnapshot>> cache =
         new Dictionary<string, KeyValuePair<DateTime, UsageSnapshot>>(StringComparer.OrdinalIgnoreCase);
+    static readonly Dictionary<string, DateTime> nextProbe =
+        new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+    static readonly TimeSpan ProbeInterval = TimeSpan.FromSeconds(30);
     static readonly Encoding Latin1 = Encoding.GetEncoding(28591);
     static readonly Regex IsoTime = new Regex(@"20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z");
 
@@ -35,10 +38,20 @@ static class UsageInfo
         {
             var blobDir = Path.Combine(dataDir, "IndexedDB", "https_claude.ai_0.indexeddb.blob");
             if (!Directory.Exists(blobDir)) return null;
+
+            // Same cheap freshness probe as AccountInfo.Email: skip the recursive walk
+            // while neither the top level of the blob tree nor the 30s gate moved.
+            var probe = Directory.GetLastWriteTimeUtc(blobDir);
+            KeyValuePair<DateTime, UsageSnapshot> hit;
+            if (cache.TryGetValue(dataDir, out hit) && hit.Key == probe) return hit.Value;
+            var now = DateTime.UtcNow;
+            DateTime nextProbe;
+            if (UsageInfo.nextProbe.TryGetValue(dataDir, out nextProbe) && now < nextProbe) return hit.Value;
+            UsageInfo.nextProbe[dataDir] = now.Add(ProbeInterval);
+
             var files = new DirectoryInfo(blobDir).GetFiles("*", SearchOption.AllDirectories)
                 .Where(f => f.Length < 50 * 1024 * 1024).ToList();
             var stamp = files.Count == 0 ? DateTime.MinValue : files.Max(f => f.LastWriteTimeUtc);
-            KeyValuePair<DateTime, UsageSnapshot> hit;
             if (cache.TryGetValue(dataDir, out hit) && hit.Key == stamp) return hit.Value;
 
             UsageSnapshot best = null;
@@ -82,11 +95,14 @@ static class UsageInfo
         int length = 0, shift = 0;
         while (true)
         {
+            if (pos >= src.Length) throw new InvalidDataException("truncated snappy header");
             int b = src[pos++];
             length |= (b & 0x7F) << shift;
             if ((b & 0x80) == 0) break;
             shift += 7;
+            if (shift > 28) throw new InvalidDataException("snappy length too long");
         }
+        if (length <= 0 || length > src.Length * 64) throw new InvalidDataException("unreasonable snappy length");
         var dst = new byte[length];
         int d = 0;
         while (pos < src.Length && d < length)
